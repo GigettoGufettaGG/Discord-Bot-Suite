@@ -1,0 +1,191 @@
+from typing import Any, Dict, List, Optional
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from discord.ui import Button, Modal, TextInput, View
+
+
+class CandidateRequestModal(Modal):
+    def __init__(self, cog: "Candidature", role_id: int, role_name: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cog = cog
+        self.role_id = role_id
+        self.role_name = role_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = "\n".join(f"{child.label}: {child.value}" for child in self.children)
+        guild_cfg = self.cog.config.get(interaction.guild_id)
+        if guild_cfg is None:
+            await interaction.response.send_message("Prima configura /setup-candi.", ephemeral=True)
+            return
+
+        category = interaction.guild.get_channel(guild_cfg.get("category_id")) if guild_cfg.get("category_id") else None
+        if category is None:
+            category = interaction.channel
+
+        role = interaction.guild.get_role(self.role_id)
+        candidate_channel = await interaction.guild.create_text_channel(
+            name=f"candidatura-{interaction.user.name.lower()}",
+            category=category,
+            reason=f"Candidatura aperta da {interaction.user.display_name}",
+        )
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        await candidate_channel.edit(overwrites=overwrites)
+        await candidate_channel.send(f"{interaction.user.mention} {role.mention if role else ''}\n\n{answers}")
+
+        if guild_cfg.get("logs_channel_id"):
+            log_channel = interaction.guild.get_channel(guild_cfg["logs_channel_id"])
+            if log_channel:
+                await log_channel.send(f"Nuova candidatura aperta: {candidate_channel.mention} da {interaction.user.mention} ({self.role_name})")
+
+        await interaction.response.send_message(f"Candidatura inviata: {candidate_channel.mention}", ephemeral=True)
+
+
+class CandidatureButton(Button):
+    def __init__(self, cog: "Candidature", label: str, role_id: int, questions: List[str]):
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        self.cog = cog
+        self.role_id = role_id
+        self.questions = questions
+
+    async def callback(self, interaction: discord.Interaction):
+        modal = CandidateRequestModal(self.cog, self.role_id, self.label, title=f"Compila: {self.label}")
+        for question in self.questions:
+            modal.add_item(TextInput(label=question, required=True, style=discord.TextStyle.short))
+        await interaction.response.send_modal(modal)
+
+
+class Candidature(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.config: Dict[int, Dict[str, Any]] = {}
+        self.enabled: Dict[int, bool] = {}
+        self.questions_by_role: Dict[int, List[str]] = {}
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        print("Candidature cog ready.")
+
+    @app_commands.command(name="setup-candi", description="Configura la sezione candidature")
+    @app_commands.describe(
+        message="Messaggio principale delle candidature",
+        category="Categoria dove creare i canali candidature",
+        logs_channel="Canale dove arrivano i log",
+    )
+    async def setup_candi(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+        category: Optional[discord.CategoryChannel] = None,
+        logs_channel: Optional[discord.TextChannel] = None,
+    ):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+
+        self.config[interaction.guild_id] = {
+            "message": message,
+            "category_id": category.id if category else None,
+            "logs_channel_id": logs_channel.id if logs_channel else None,
+            "button_roles": {},
+            "button_message_id": None,
+        }
+        self.enabled.setdefault(interaction.guild_id, True)
+        await interaction.response.send_message(f"Sistema candidature configurato.\nMessaggio: {message}", ephemeral=True)
+
+    @app_commands.command(name="candi-role", description="Collega ruolo e domande ad un bottone di candidatura")
+    @app_commands.describe(
+        button_name="Nome del bottone",
+        role="Ruolo da associare",
+        questions="Domande separate da |",
+    )
+    async def candi_role(self, interaction: discord.Interaction, button_name: str, role: discord.Role, questions: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+
+        guild_cfg = self.config.setdefault(interaction.guild_id, {
+            "message": "Candidatura aperta",
+            "category_id": None,
+            "logs_channel_id": None,
+            "button_roles": {},
+            "button_message_id": None,
+        })
+        guild_cfg["button_roles"][button_name] = {
+            "role_id": role.id,
+            "questions": [q.strip() for q in questions.split("|") if q.strip()],
+        }
+        await interaction.response.send_message(f"Bottone `{button_name}` collegato al ruolo {role.mention}.", ephemeral=True)
+
+    @app_commands.command(name="candi-send", description="Pubblica il messaggio delle candidature con bottoni")
+    @app_commands.describe(channel="Canale dove inviare il messaggio")
+    async def candi_send(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+
+        guild_cfg = self.config.get(interaction.guild_id)
+        if guild_cfg is None:
+            await interaction.response.send_message("Prima configuri /setup-candi.", ephemeral=True)
+            return
+
+        view = View(timeout=None)
+        for name, data in guild_cfg["button_roles"].items():
+            view.add_item(CandidatureButton(self, name, data["role_id"], data["questions"]))
+
+        message = await channel.send(guild_cfg["message"], view=view)
+        guild_cfg["button_message_id"] = message.id
+        await interaction.response.send_message(f"Messaggio candidature inviato in {channel.mention}.", ephemeral=True)
+
+    @app_commands.command(name="disattivare", description="Disattiva la sezione candidature")
+    async def disattivare(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+        self.enabled[interaction.guild_id] = False
+        await interaction.response.send_message("Candidature disattivate.", ephemeral=True)
+
+    @app_commands.command(name="attiva", description="Riattiva la sezione candidature")
+    async def attiva(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+        self.enabled[interaction.guild_id] = True
+        await interaction.response.send_message("Candidature riattivate.", ephemeral=True)
+
+    @app_commands.command(name="domande-setup", description="Imposta le domande per un ruolo")
+    @app_commands.describe(role="Ruolo di riferimento", questions="Domande separate da |")
+    async def domande_setup(self, interaction: discord.Interaction, role: discord.Role, questions: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Non hai i permessi necessari.", ephemeral=True)
+            return
+        self.questions_by_role[role.id] = [q.strip() for q in questions.split("|") if q.strip()]
+        await interaction.response.send_message(f"Domande impostate per {role.mention}.", ephemeral=True)
+
+    @app_commands.command(name="domande", description="Mostra le domande impostate per un ruolo")
+    @app_commands.describe(role="Ruolo da controllare")
+    async def domande(self, interaction: discord.Interaction, role: discord.Role):
+        domande = self.questions_by_role.get(role.id, [])
+        if not domande:
+            await interaction.response.send_message(f"Nessuna domanda configurata per {role.mention}.", ephemeral=True)
+            return
+        content = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(domande))
+        await interaction.response.send_message(f"Domande per {role.mention}:\n{content}", ephemeral=True)
+
+    @app_commands.command(name="candidatura", description="Apri una candidatura se il sistema è attivo")
+    async def candidatura(self, interaction: discord.Interaction):
+        if not self.enabled.get(interaction.guild_id, True):
+            await interaction.response.send_message("Momentaneamente non stiamo cercando candidati.", ephemeral=True)
+            return
+        await interaction.response.send_message("Candidatura aperta. Usa i bottoni disponibili per inviare il modulo.", ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Candidature(bot))
